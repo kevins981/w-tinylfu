@@ -201,7 +201,9 @@ private:
      */
     int sampling_size() const noexcept
     {
-        return table_.size() * 10;
+        //return table_.size() * 10;
+        //return 3999999;
+        return 13000000;
     }
 };
 
