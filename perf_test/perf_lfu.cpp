@@ -19,12 +19,16 @@
 #include <numa.h>
 #include <numaif.h>
 #include <errno.h>
+#include <syscall.h>
+
 
 #include "../wtinylfu.hpp"
 #include "../bloom_filter.hpp"
 
 // Perf related 
-#define PERF_PAGES	(1 + (1 << 16))	// Has to be == 1+2^n, here 1MB
+//#define PERF_PAGES	(1 + (1 << 16))	// Has to be == 1+2^n, 
+//#define PERF_PAGES	(1 + (1 << 7))	// Has to be == 1+2^n, 
+#define PERF_PAGES	(1 + (1 << 9))	// Has to be == 1+2^n, 
 #define NPROC 64
 #define NPBUFTYPES 2
 #define LOCAL_DRAM_LOAD 0
@@ -33,7 +37,6 @@
 
 // TinyLFU related
 #define NUM_ENTRIES 108000000/16
-#define CACHE_SIZE 700000
 
 int fd[NPROC][NPBUFTYPES];
 static struct perf_event_mmap_page *perf_page[NPROC][NPBUFTYPES];
@@ -63,7 +66,7 @@ struct perf_event_mmap_page* perf_setup(__u64 config, __u64 cpu, __u64 type) {
     pe.size = sizeof(pe);
     pe.config = config;
     pe.sample_period = 200;
-    pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR | PERF_SAMPLE_ID;
+    pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
     pe.disabled = 0;
     pe.freq = 0;
     pe.exclude_kernel = 1;
@@ -102,8 +105,12 @@ struct perf_event_mmap_page* perf_setup(__u64 config, __u64 cpu, __u64 type) {
 }
 
 void* perf_func(void*) {
-//int main() {
-    printf("getpid : %d \n", getpid());
+    printf("4 getpid : %d \n", getpid());
+    pthread_t tid = pthread_self();
+    int sid = syscall(SYS_gettid);
+    printf("LWP id is %d\n", sid);
+    printf("POSIX thread id is %ld\n", tid);
+
     uint64_t throttle_cnt = 0;
     uint64_t unthrottle_cnt = 0;
     uint64_t unknown_cnt = 0;
@@ -114,50 +121,6 @@ void* perf_func(void*) {
       perf_page[i][LOCAL_DRAM_LOAD]  = perf_setup(0x1d3, i, LOCAL_DRAM_LOAD); // MEM_LOAD_L3_MISS_RETIRED.LOCAL_DRAM
       perf_page[i][REMOTE_DRAM_LOAD] = perf_setup(0x2d3, i, REMOTE_DRAM_LOAD); // MEM_LOAD_L3_MISS_RETIRED.REMOTE_DRAM
     }
-    //memset(&pe, 0, sizeof(pe));
-
-    //pe.type = PERF_TYPE_RAW;
-    //pe.size = sizeof(pe);
-    ////pe.config = 0x1d3; // local DRAM 
-    //pe.config = 0x2d3; // remote DRAM 
-    //pe.sample_period = 200;
-    //pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR;
-    //pe.disabled = 0;
-    //pe.freq = 0;
-    //pe.exclude_kernel = 1;
-    //pe.exclude_hv = 0;
-    //pe.exclude_callchain_kernel = 1;
-    ////pe.exclude_callchain_user = 1;
-    //pe.precise_ip = 1;
-    //pe.inherit = 1; 
-    //pe.task = 1; 
-    //pe.sample_id_all = 1;
-
-    //// perf_event_open args: perf_event_attr, pid, cpu, group_fd, flags.
-    //// pid == 0 && cpu == -1: measures the calling process/thread on any CPU.
-    //// returns a file descriptor, for use in subsequent system calls.
-    ////fd = perf_event_open(&pe, 0, -1, -1, 0);
-    //for (int i = 0; i < NPROC; i++) {
-    //  fd[i] = perf_event_open(&pe, -1, i, -1, 0);
-    //  if (fd[i] == -1) {
-    //     std::perror("failed");
-    //     fprintf(stderr, "Error opening leader %llx\n", pe.config);
-    //     exit(EXIT_FAILURE);
-    //  }
-
-    //  size_t mmap_size = sysconf(_SC_PAGESIZE) * PERF_PAGES;
-
-    //  // mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
-    //  // prot: protection. How the page may be used.
-    //  // flags: whether updates to the mapping are visible to other processes mapping the same region.
-    //  // fd: file descriptor.
-    //  // offset: offset into the file.
-    //  perf_page[i] = (perf_event_mmap_page *)mmap(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd[i], 0);
-    //  if(perf_page[i] == MAP_FAILED) {
-    //    perror("mmap");
-    //  }
-    //  assert(perf_page[i] != MAP_FAILED);
-    //}
 
     std::cout << "start perf recording." << std::endl;
 
@@ -184,6 +147,7 @@ void* perf_func(void*) {
     int migrate_nodes[1] = {0}; // migrate to node 0
     int migrate_status[1] = {99};
     long pages_migrated = 0;
+    long pages_already_in_node0 = 0;
     int move_page_ret;
 
     // start perf monitoring.
@@ -205,33 +169,38 @@ void* perf_func(void*) {
           struct perf_sample* ps;
           switch(ph->type) {
             case PERF_RECORD_SAMPLE:
-              //printf(" [DEBUG]: %llx , %d \n", ps->addr, ps->pid);
               ps = (struct perf_sample*)ph;
               assert(ps != NULL);
-              //std::cout << std::hex << ps->addr << std::endl;
-              //outfile << std::hex << ps->addr << std::endl;
               page_addr = ps->addr & ~(0xFFF); // get virtual page address from address
-              //std::cout << std::hex << "page addr " << page_addr << std::endl;
               lfu.record_access(page_addr);
               if (lfu.frequency(page_addr) >= hot_thresh) {
-                // promote hot page to fast tier memory
-                migrate_pages[0] = (int*)page_addr; // migrate
-                move_page_ret = numa_move_pages(0, 1, (void **)migrate_pages, migrate_nodes, migrate_status, MPOL_MF_MOVE_ALL);
-                if (move_page_ret) { 
-                  // a non zero value is returned.
-                  if (move_page_ret == -1) {
-                    std::cout << "ERROR: page migrating page " << migrate_pages[0] << " failed with code " << strerror(errno) << std::endl;
-                    //return NULL;
+                migrate_pages[0] = (int*)page_addr;
+                // first check if this page is already in node 0.
+                numa_move_pages(0, 1, (void **)migrate_pages, NULL, migrate_status, MPOL_MF_MOVE_ALL);
+                if (migrate_status[0] == 0){
+                  // page is already in node 0
+                  pages_already_in_node0++;
+                } else {
+                  // promote hot page to fast tier memory
+                  move_page_ret = numa_move_pages(0, 1, (void **)migrate_pages, migrate_nodes, migrate_status, MPOL_MF_MOVE_ALL);
+                  if (move_page_ret) { 
+                    // a non zero value is returned.
+                    std::cout << "WARNING: migrating page " << migrate_pages[0] << " failed with " << strerror(errno) << std::endl;
+                  } else if (migrate_status[0] < 0) {
+                    std::cout << "migration status is -ve:  " << strerror(-1*migrate_status[0]) << std::endl;
                   } else {
-                    // positive return value indicate the number of nonmigrated pages.
-                    std::cout << "migration failed " << std::endl;
+                    pages_migrated++;
                   }
                 }
-                pages_migrated++;
               }
               if (sample_cnt % 100000 == 0){
-                //std::cout << "pages migrated: " << pages_migrated << std::endl;
-                std::cout << "samples: " << sample_cnt << std::endl;
+                std::cout << "pages migrated: " << pages_migrated << std::endl;
+                std::cout << "pages already in node 0: " << pages_already_in_node0 << std::endl;
+                //std::cout << "samples: " << sample_cnt << std::endl;
+              }
+              if (pages_migrated  > 1000000) {
+                std::cout << "migrated 1M pages. Stop. " << std::endl;
+                return NULL;
               }
               sample_cnt++;
               break;
